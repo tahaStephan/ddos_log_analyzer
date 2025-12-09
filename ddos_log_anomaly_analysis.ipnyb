@@ -1,0 +1,406 @@
+{
+ "nbformat": 4,
+ "nbformat_minor": 5,
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.10"
+  }
+ },
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Web Sunucu Log Analizi ile DDoS / Anomali Tespiti \\n",
+    "\\n",
+    "Bu notebook'ta sentetik (üretilmiş) web server loglarını analiz ederek: \\n",
+    "- Anomali (yüksek response time) tespiti (3-sigma kuralı ile)\\n",
+    "- IP bazlı saldırı / anomali adaylarını bulma (yüksek istek hacmi, 404 brute force)\\n",
+    "- Zaman bazlı trafik yoğunluğu\\n",
+    "\\n",
+    "**Teknolojiler**: Python, NumPy, Pandas, Matplotlib\\n",
+    "\\n",
+    "**Senaryo**: 1000+ satırlık Apache/Nginx benzeri log. İçinde birkaç \"saldırgan\" IP yüksek trafik / 404 brute force / yüksek gecikme yaratıyor. Bu IP'leri ve zaman pencerelerini otomatik tespit ediyoruz."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\"\"\"Kurulum / Kütüphaneler\"\"\"\\n",
+    "import re\\n",
+    "import random\\n",
+    "from datetime import datetime, timedelta\\n",
+    "\\n",
+    "import numpy as np\\n",
+    "import pandas as pd\\n",
+    "import matplotlib.pyplot as plt\\n",
+    "\\n",
+    "random.seed(42)\\n",
+    "np.random.seed(42)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1) Sentetik Log Üretimi\\n",
+    "- Normal trafik: makul istek hacmi, düşük hata oranı\\n",
+    "- Saldırgan IP'ler: yüksek istek hacmi, 404 brute force, yüksek response time spike'ları\\n",
+    "- Amaç: Gerçekçi (ancak üretilebilir) bir veri seti"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Parametreler\\n",
+    "n_rows = 1200\\n",
+    "start_ts = datetime(2025, 5, 1, 10, 0, 0)\\n",
+    "methods = [\"GET\", \"POST\", \"PUT\", \"DELETE\"]\\n",
+    "endpoints = [\\n",
+    "    \"/\", \"/login\", \"/search\", \"/products\", \"/products/42\", \"/admin\", \"/static/js/app.js\",\\n",
+    "    \"/api/items\", \"/api/items/42\", \"/images/logo.png\"\\n",
+    "]\\n",
+    "status_choices = [200, 200, 200, 200, 201, 301, 302, 400, 401, 403, 404, 500]\\n",
+    "\\n",
+    "# Normal IP'ler\\n",
+    "normal_ips = [f\"192.168.0.{i}\" for i in range(10, 50)]\\n",
+    "# Saldırgan IP'ler\\n",
+    "attack_ips = [\"10.0.0.66\", \"10.0.0.77\"]  # yüksek hacim ve 404 brute force\\n",
+    "slow_ip = \"172.16.0.99\"  # response time spike\\n",
+    "\\n",
+    "logs = []\\n",
+    "for i in range(n_rows):\\n",
+    "    ts = start_ts + timedelta(seconds=i * random.choice([1, 1, 2, 3]))\\n",
+    "    # Trafiğin bir kısmını saldırganlara yönlendirelim\\n",
+    "    ip = random.choices(\\n",
+    "        population=normal_ips + attack_ips + [slow_ip],\\n",
+    "        weights=[1]*len(normal_ips) + [8, 8] + [4],\\n",
+    "        k=1\\n",
+    "    )[0]\\n",
+    "\\n",
+    "    method = random.choice(methods)\\n",
+    "    endpoint = random.choice(endpoints)\\n",
+    "    status = random.choices(status_choices, weights=[30,30,30,30,10,5,5,5,5,5,20,2], k=1)[0]\\n",
+    "\\n",
+    "    # Bytes ve response time modellemesi\\n",
+    "    base_rt = np.random.normal(loc=120, scale=40)  # ms\\n",
+    "    # Slow IP için ara sıra spike\\n",
+    "    if ip == slow_ip and random.random() < 0.2:\\n",
+    "        base_rt *= random.uniform(3, 6)\\n",
+    "    # 500 hata kodu olursa rt artabilir\\n",
+    "    if status >= 500:\\n",
+    "        base_rt *= random.uniform(1.5, 2.5)\\n",
+    "    # Saldırgan IP'ler için 404 brute force yapalım\\n",
+    "    if ip in attack_ips and random.random() < 0.25:\\n",
+    "        status = 404\\n",
+    "    response_time = max(5, base_rt)\\n",
+    "    bytes_sent = int(abs(np.random.normal(loc=15_000, scale=5_000)))\\n",
+    "\\n",
+    "    log_line = f\"{ip} - - [{ts.strftime('%d/%b/%Y:%H:%M:%S %z')}] \\\"{method} {endpoint} HTTP/1.1\\\" {status} {bytes_sent} {response_time:.1f}\"\\n",
+    "    logs.append(log_line)\\n",
+    "\\n",
+    "len(logs), logs[:3]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2) Log Parse\\n",
+    "- Regex ile IP, timestamp, method, endpoint, status, bytes, response_time alanlarını çıkaralım\\n",
+    "- DataFrame'e dönüştürelim"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pattern = re.compile(r\"^(?P<ip>\\S+) - - \\[(?P<time>[^\\]]+)\\] \\\"(?P<method>\\S+) (?P<endpoint>\\S+) [^\\\"]+\\\" (?P<status>\\d{3}) (?P<bytes>\\d+) (?P<rt>[0-9.]+)\")\\n",
+    "\\n",
+    "records = []\\n",
+    "for line in logs:\\n",
+    "    m = pattern.match(line)\\n",
+    "    if m:\\n",
+    "        d = m.groupdict()\\n",
+    "        d[\"status\"] = int(d[\"status\"])\\n",
+    "        d[\"bytes\"] = int(d[\"bytes\"])\\n",
+    "        d[\"response_time_ms\"] = float(d.pop(\"rt\"))\\n",
+    "        d[\"time\"] = datetime.strptime(d[\"time\"], \"%d/%b/%Y:%H:%M:%S %z\") if \"%z\" in d[\"time\"] else datetime.strptime(d[\"time\"], \"%d/%b/%Y:%H:%M:%S\")\\n",
+    "        records.append(d)\\n",
+    "\\n",
+    "df = pd.DataFrame(records)\\n",
+    "df.head()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3) Hızlı Bakış ve Temizlik\\n",
+    "- Eksik veri kontrolü\\n",
+    "- Türler ve temel istatistikler"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df.info()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df.describe(include=\"all\").T"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4) Özellik Mühendisliği\\n",
+    "- Dakika bazlı zaman damgası (trafik yoğunluğu)\\n",
+    "- Response time z-score (3-sigma anomalisi)\\n",
+    "- İstek hacmi / hata oranları"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df[\"minute\"] = df[\"time\"].dt.floor(\"T\")\\n",
+    "\\n",
+    "# Z-score ile response time anomalisi (3-sigma)\\n",
+    "mu = df[\"response_time_ms\"].mean()\\n",
+    "sigma = df[\"response_time_ms\"].std()\\n",
+    "df[\"z_rt\"] = (df[\"response_time_ms\"] - mu) / sigma\\n",
+    "df[\"rt_anomaly\"] = df[\"z_rt\"].abs() >= 3\\n",
+    "\\n",
+    "mu, sigma, df[\"rt_anomaly\"].sum()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5) Trafik Yoğunluğu (Dakika Bazlı)\\n",
+    "- Dakika başına istek sayısı\\n",
+    "- Ani yükselişler olası DDoS göstergesi"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "traffic_per_min = df.groupby(\"minute\").size().reset_index(name=\"request_count\")\\n",
+    "traffic_per_min.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(12,4))\\n",
+    "plt.plot(traffic_per_min[\"minute\"], traffic_per_min[\"request_count\"], marker=\"o\", linewidth=1)\\n",
+    "plt.title(\"Dakika Bazlı Trafik Hacmi\")\\n",
+    "plt.xlabel(\"Zaman\")\\n",
+    "plt.ylabel(\"İstek Sayısı\")\\n",
+    "plt.xticks(rotation=45)\\n",
+    "plt.tight_layout()\\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6) IP Bazlı Analiz\\n",
+    "- Toplam istek sayısı (yüksek hacim)\\n",
+    "- 404 sayısı (brute force denemesi)\\n",
+    "- Ortalama response time ve anomaly sayısı"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ip_stats = (\\n",
+    "    df.groupby(\"ip\").agg(\\n",
+    "        requests=(\"ip\", \"count\"),\\n",
+    "        errors_404=(\"status\", lambda x: (x==404).sum()),\\n",
+    "        mean_rt_ms=(\"response_time_ms\", \"mean\"),\\n",
+    "        rt_anoms=(\"rt_anomaly\", \"sum\"),\\n",
+    "    ).sort_values(\"requests\", ascending=False)\\n",
+    ")\\n",
+    "\\n",
+    "ip_stats.head(10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(10,5))\\n",
+    "top = ip_stats.head(10)\\n",
+    "plt.bar(top.index, top[\"requests\"], color=\"tab:blue\")\\n",
+    "plt.xticks(rotation=45)\\n",
+    "plt.title(\"IP Bazlı İstek Hacmi (Top 10)\")\\n",
+    "plt.ylabel(\"İstek Sayısı\")\\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 404 Bruteforce Adayları\\n",
+    "- 404 sayısı yüksek IP'ler\\n",
+    "- requests ve 404 birlikte gözlenir"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "top_404 = ip_stats.sort_values(\"errors_404\", ascending=False).head(10)\\n",
+    "top_404"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7) Response Time Anomalileri\\n",
+    "- 3-sigma kuralı ile işaretlenen satırları listeleyelim\\n",
+    "- Bu satırlar hangi IP ve endpoint'lerde yoğunlaşmış?"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "anoms = df[df[\"rt_anomaly\"]]\\n",
+    "anoms.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "anoms_ip = anoms.groupby(\"ip\").size().sort_values(ascending=False)\\n",
+    "anoms_ip.head(10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8) Basit Saldırgan Tespit Kuralları\\n",
+    "- **Kural 1 (Hacim)**: IP istek sayısı > 90. persentil\\n",
+    "- **Kural 2 (404)**: 404 sayısı > 95. persentil\\n",
+    "- **Kural 3 (Latency)**: rt_anomaly sayısı > 0\\n",
+    "\\n",
+    "Bu kuralları OR ile birleştirerek şüpheli IP listesi çıkaralım."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "req_thr = ip_stats[\"requests\"].quantile(0.90)\\n",
+    "err_thr = ip_stats[\"errors_404\"].quantile(0.95)\\n",
+    "\\n",
+    "suspects = ip_stats[(ip_stats[\"requests\"] > req_thr) | (ip_stats[\"errors_404\"] > err_thr) | (ip_stats[\"rt_anoms\"] > 0)]\\n",
+    "suspects.sort_values(\"requests\", ascending=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9) Zaman Penceresi Bazlı Yoğunluk\\n",
+    "- Dakika başına IP bazlı istek sayısı (pivot)\\n",
+    "- Ani pikler var mı?"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ip_minute = df.groupby([\"minute\", \"ip\"]).size().reset_index(name=\"count\")\\n",
+    "pivot = ip_minute.pivot(index=\"minute\", columns=\"ip\", values=\"count\").fillna(0)\\n",
+    "\\n",
+    "# Top 5 hacimli IP'yi çizelim\\n",
+    "top_ips = ip_stats.head(5).index\\n",
+    "plt.figure(figsize=(12,5))\\n",
+    "for ip in top_ips:\\n",
+    "    plt.plot(pivot.index, pivot[ip], label=ip)\\n",
+    "plt.legend()\\n",
+    "plt.xticks(rotation=45)\\n",
+    "plt.title(\"Dakika Bazlı IP Trafiği (Top 5 IP)\")\\n",
+    "plt.ylabel(\"İstek Sayısı\")\\n",
+    "plt.tight_layout()\\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10) Özet ve İçgörüler (Insight)\\n",
+    "- Yüksek hacimli IP'ler (olası DDoS): `10.0.0.66`, `10.0.0.77` (örnek)\\n",
+    "- Yüksek 404 brute force: aynı IP'ler + en çok 404 alanlar\\n",
+    "- Yüksek gecikme anomalileri: `172.16.0.99` (slow) ve hata durumları\\n",
+    "- Trafik pikleri: dakika bazlı grafikte ani yükselişler izlenebilir\\n",
+    "\\n",
+    "### Rapor Notları (Ödev Sunumu için)\\n",
+    "- **Veri kaynağı**: Sentetik üretildi, Apache/Nginx stil log formatı\\n",
+    "- **Temizlik**: Regex parse, tip dönüşümleri, eksik veri yok\\n",
+    "- **EDA**: Trafik hacmi, status dağılımları, IP yoğunluğu\\n",
+    "- **Anomali Tespiti**: 3-sigma ile response time outlier, persentil tabanlı hacim ve 404 kuralları\\n",
+    "- **Sonuç**: Saldırgan IP listesi, zaman pencereleri, olası DDoS / brute force bulguları\\n",
+    "\\n",
+    "> Notebook içinde tüm kod ve yorumlar mevcut. Sunumda grafikler ve yukarıdaki çıkarımlar anlatılabilir."
+   ]
+  }
+ ]
+}
