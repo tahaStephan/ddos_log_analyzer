@@ -10,7 +10,7 @@ tespit etmeyi gösterir.
 ## Kullanılan Teknolojiler
 - Python, Jupyter Notebook
 - NumPy, Pandas
-- Matplotlib, Seaborn
+- Matplotlib
 
 ## Çalıştırma
 1) Ortamı kur:
@@ -21,7 +21,7 @@ tespit etmeyi gösterir.
    ```bash
    jupyter notebook notebooks/ddos_log_anomaly_analysis.ipynb
    ```
-3) Hücreleri sırayla çalıştır. Sentetik log üretilir, parse edilir ve analiz/visualization adımları yapılır.
+3) Hücreleri sırayla çalıştır. Sentetik log üretilir, parse edilir ve analiz/grafikler yapılır.
 
 ## Dosya Yapısı
 - `notebooks/ddos_log_anomaly_analysis.ipynb`: Tüm analiz akışı
